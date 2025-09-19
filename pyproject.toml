@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tilesmith"
+version = "0.1.0"
+description = "Educational tiled matmul autotuner (time/energy)"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name="TileSmith Authors"}]
+dependencies = [
+  "numpy",
+  "scipy",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+torch = ["torch", "torchvision", "torchaudio",]
+dev = ["pytest", "matplotlib",]
+
+[project.urls]
+Homepage = "https://example.com/tilesmith"
