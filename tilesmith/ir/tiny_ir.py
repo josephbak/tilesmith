@@ -49,6 +49,12 @@ class Op:
             return f"{self.result.name} = input \"{self.attrs.get('name','?')}\" : {self.result_type}"
         elif self.opname == "return":
             return f"return {ops}"
+        elif self.opname == "const":
+            src = self.attrs.get("name", "const")
+            return f"{self.result.name} = const \"{src}\" : {self.result_type}"
+        elif self.opname == "fused_mlp":
+            sig = "(" + ", ".join(str(o.type) for o in self.operands) + f") -> {self.result_type}"
+            return f"{self.result.name} = fused_mlp " + ", ".join(o.name for o in self.operands) + f" : {sig}"
         else:
             return f"{self.result.name} = {self.opname} {ops} : {self.result_type}"
 
@@ -102,7 +108,7 @@ class IRBuilder:
         aty, bty = a.type, b.type
         M, K1 = aty.shape
         K2, N = bty.shape
-        _require_shape_eq(K1, K2, "matmul: K dims must match")
+        _require_dim_eq(K1, K2, "matmul: K dims must match")
         out_ty = TensorType(out_dtype or aty.dtype, (M, N))
         v = Value(self.fresh("y"), out_ty)
         op = Op("matmul", [a, b], out_ty)
@@ -110,18 +116,26 @@ class IRBuilder:
         return op
 
     def add(self, x: Value, y: Value) -> Op:
-        # Simple rule: allow broadcast along the last dim if one operand is rank-1 (N) or (1xN)
         xt, yt = x.type, y.type
-        _require_shape_eq(xt.dtype, yt.dtype, "add: dtype mismatch")
+        _require(xt.dtype == yt.dtype, "add: dtype mismatch")
+
         xs, ys = xt.shape, yt.shape
-        # Normalize bias shapes: (N) -> (1,N)
-        ys_norm = ys
+
+        # Only support (MxN) + (N) or (MxN) + (1xN)
+        _require(len(xs) == 2, "add: left must be rank-2 (MxN)")
+
+        # Normalize bias to rank-2 (1xN) if needed
         if len(ys) == 1:
             ys_norm = (1, ys[0])
-        # Now require xs and ys_norm be broadcast-compatible where ys_norm[0] can be 1
-        _require(len(xs) == 2 and len(ys_norm) == 2, "add: only (MxN) + (N) or (1xN) supported")
-        _require_shape_eq(xs[1], ys_norm[1], "add: last dim must match")
-        # No constraint on xs[0] vs ys_norm[0] (broadcast over rows)
+        elif len(ys) == 2:
+            ys_norm = ys
+            _require_dim_eq(ys_norm[0], 1, "add: only row-broadcast (1xN) supported")
+        else:
+            raise ValueError("add: right rank must be 1 (N) or 2 (1xN)")
+
+        # Last dim must match (use dim comparer, not shape comparer)
+        _require_dim_eq(xs[1], ys_norm[1], "add: last dim must match")
+
         out_ty = TensorType(xt.dtype, xs)
         v = Value(self.fresh("y"), out_ty)
         op = Op("add", [x, y], out_ty)
@@ -138,6 +152,26 @@ class IRBuilder:
     def ret(self, x: Value) -> Op:
         op = Op("return", [x], x.type)
         return op
+
+    def const(self, name: str, ty: TensorType, value=None) -> Op:
+        """Constant tensor (e.g., weights, bias). Value can be stored in attrs if you like."""
+        v = Value(self.fresh("c"), ty)
+        op = Op("const", [], ty, attrs={"name": name, "value": value})
+        op.set_result(v)
+        return op
+
+    def fused_mlp(self, X: Value, W: Value, b: Value) -> Op:
+        """Fused matmul+bias+gelu: (MxK,@KxN)+N -> (MxN). Types must already match."""
+        M, K1 = X.type.shape
+        K2, N = W.type.shape
+        _require_dim_eq(K1, K2, "fused_mlp: K dims must match")
+        _require_shape_eq((N,), (b.type.shape[0],), "fused_mlp: bias last dim mismatch")
+        out_ty = TensorType(X.type.dtype, (M, N))
+        v = Value(self.fresh("y"), out_ty)
+        op = Op("fused_mlp", [X, W, b], out_ty)
+        op.set_result(v)
+        return op
+
 
 # ---- Assert helpers (symbol-aware) ----
 
@@ -156,6 +190,7 @@ def _require_dim_eq(a, b, msg: str):
     else:
         # Mixed int vs symbol: keep strict for now
         raise ValueError(msg + f" (got {a} vs {b})")
+        
 
 def _require_shape_eq(sa, sb, msg: str):
     # sa, sb: tuples of dims
@@ -168,37 +203,77 @@ def _require_shape_eq(sa, sb, msg: str):
 # ===== Demo: build and verify Y = GELU(X @ W + b) =====
 
 def build_mlp_module() -> Module:
-    b = IRBuilder()
-
-    # Types with symbolic dims
+    bld = IRBuilder()
     tX = TensorType("f32", ("M", "K"))
     tW = TensorType("f32", ("K", "N"))
-    tb = TensorType("f32", ("N",))      # rank-1; will broadcast over rows
+    tb = TensorType("f32", ("N",))
     tY = TensorType("f32", ("M", "N"))
 
-    # Inputs
-    opX = b.input("X", tX)
-    opW = b.input("W", tW)
-    opb = b.input("b", tb)
+    opX = bld.input("X", tX)
+    opW = bld.const("W", tW)     # <- const instead of input
+    opb = bld.const("b", tb)     # <- const instead of input
 
-    # Ops: y0 = X@W; y1 = y0 + b; y2 = gelu(y1)
-    op0 = b.matmul(opX.result, opW.result)
-    op1 = b.add(op0.result, opb.result)
-    op2 = b.gelu(op1.result)
-    opR = b.ret(op2.result)
+    op0 = bld.matmul(opX.result, opW.result)
+    op1 = bld.add(op0.result, opb.result)
+    op2 = bld.gelu(op1.result)
+    opR = bld.ret(op2.result)
 
     func = Func(
         name="mlp",
-        args=[opX.result, opW.result, opb.result],
+        args=[opX.result],  # only X is a runtime arg now
         result_type=tY,
         body=Block(ops=[opX, opW, opb, op0, op1, op2, opR])
     )
-    mod = Module(funcs=[func])
-    # Verify result type matches return
     _require_shape_eq(func.result_type.shape, op2.result.type.shape, "func result shape mismatch")
-    return mod
+    return Module(funcs=[func])
 
 
 if __name__ == "__main__":
-    mod = build_mlp_module()
+    import numpy as np
+
+    # Concrete dims for a quick smoke test
+    M, K, N = 4, 8, 16
+
+    # Make some test weights/bias (like a frozen model)
+    rng = np.random.default_rng(0)
+    W_val = rng.standard_normal((K, N), dtype=np.float32)   # IR expects [K,N]
+    b_val = rng.standard_normal((N,),    dtype=np.float32)
+
+    bld = IRBuilder()
+
+    # Types with concrete dims for this test
+    tX = TensorType("f32", (M, K))
+    tW = TensorType("f32", (K, N))
+    tb = TensorType("f32", (N,))
+    tY = TensorType("f32", (M, N))
+
+    # X is a runtime input; W and b are graph constants
+    opX = bld.input("X", tX)
+    opW = bld.const("W", tW, value=W_val)
+    opb = bld.const("b", tb, value=b_val)
+
+    # y = GELU( X @ W + b )
+    op0 = bld.matmul(opX.result, opW.result)
+    op1 = bld.add(op0.result, opb.result)
+    op2 = bld.gelu(op1.result)
+    opR = bld.ret(op2.result)
+
+    func = Func(
+        name="mlp_const_demo",
+        args=[opX.result],  # only X is a runtime arg
+        result_type=tY,
+        body=Block(ops=[opX, opW, opb, op0, op1, op2, opR])
+    )
+    _require_shape_eq(func.result_type.shape, op2.result.type.shape, "func result shape mismatch")
+    mod = Module(funcs=[func])
+
+    # Pretty-print the IR
     print(mod)
+
+    # Quick sanity on const payloads
+    # (attrs["value"] holds the actual numpy arrays you passed)
+    W_payload = opW.attrs.get("value", None)
+    b_payload = opb.attrs.get("value", None)
+    assert isinstance(W_payload, np.ndarray) and W_payload.shape == (K, N)
+    assert isinstance(b_payload, np.ndarray) and b_payload.shape == (N,)
+    print("\n[const check] W:", W_payload.shape, W_payload.dtype, " b:", b_payload.shape, b_payload.dtype)
